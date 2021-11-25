@@ -15,6 +15,10 @@
 #include <time.h>
 #include <sys/time.h>
 #include <signal.h>
+#include <sys/syslimits.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <ctype.h>
 
 int socket_fd;
 
@@ -23,21 +27,79 @@ void error(const char *msg)
     perror(msg);
     exit(1);
 }
-
-char *process_my_request(char *buffer, int fd)
+char *ltrim(char *s)
 {
-    char *response = malloc(sizeof(char) * 512);
-    char number_fd[10];
-    struct timeval tv;
-    sprintf(number_fd, "%d", fd);
-    strcpy(response, "Coming from :");
-    strcat(response, number_fd);
-    strcat(response, "\r\n at: ");
-    gettimeofday(&tv, NULL);
-    strcat(response, (char *)ctime(&tv.tv_sec));
-    strcat(response, "\r\n");
-    strcat(response, buffer);
-    return response;
+    while (isspace(*s))
+        s++;
+    return s;
+}
+
+char *rtrim(char *s)
+{
+    char *back = s + strlen(s);
+    while (isspace(*--back))
+        ;
+    *(back + 1) = '\0';
+    return s;
+}
+
+char *trim(char *s)
+{
+    return rtrim(ltrim(s));
+}
+
+int getServerFileDescriptor(char *fileName)
+{
+    char *path;
+    long size;
+    int fd;
+    size = pathconf(".", _PC_PATH_MAX);
+    path = (char *)malloc(size);
+    bzero(path, size);
+    getcwd(path, (size_t)size);
+    strcat(path, "/public_files/");
+    strcat(path, fileName);
+    path = trim(path);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        perror("File open failed");
+        return -1;
+    }
+    return fd;
+}
+
+char *cleanPath(char *path)
+{
+    char *newPath = (char *)malloc(strlen(path) + 1);
+    path = trim(path);
+    int i = 0;
+    for (i = 0; i < strlen(path); i++)
+    {
+        if (path[i] == '/')
+        {
+            newPath[i] = '_';
+        }
+        else
+        {
+            newPath[i] = path[i];
+        }
+    }
+    newPath[i] = '\0';
+    return newPath;
+}
+
+char *process_my_request(char *buffer)
+{
+    int fd = getServerFileDescriptor(cleanPath(buffer));
+    if (fd < 0)
+        return NULL;
+    struct stat st;
+    fstat(fd, &st);
+    char *file_buffer = malloc(st.st_size);
+    read(fd, file_buffer, st.st_size);
+    close(fd);
+    return file_buffer;
 }
 
 int isRequestForNewConnection(int fd, int listener)
@@ -79,11 +141,16 @@ int accept_connection(int listener)
 
 void handle_request(char *buffer, int fd, int *fdmax)
 {
-    char *response = process_my_request(buffer, fd);
-    for (int i = 0; i < *fdmax + 1; i++)
-        if (i != fd)
-            write(i, response, strlen(response));
-    free(response);
+    char *response = process_my_request(buffer);
+    if (response != NULL)
+    {
+        write(fd, response, strlen(response));
+        free(response);
+    }
+    else
+    {
+        write(fd, "404", 3);
+    }
 }
 
 void handle_new_connection(int fd, int *fdmax, fd_set *fds)
