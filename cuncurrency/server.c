@@ -16,6 +16,8 @@
 #include <sys/time.h>
 #include <signal.h>
 
+int socket_fd;
+
 void error(const char *msg)
 {
     perror(msg);
@@ -147,17 +149,29 @@ int poll_loop(int socket_file_descriptor)
 
 int server_init(int port_number)
 {
-    int socket_file_descriptor;
-    socket_file_descriptor = bind_socket(port_number);
-    listen(socket_file_descriptor, 5);
-    poll_loop(socket_file_descriptor);
-    close(socket_file_descriptor);
+    socket_fd = bind_socket(port_number);
+    listen(socket_fd, 5);
+    poll_loop(socket_fd);
+    close(socket_fd);
     return 0;
+}
+
+void sigint_handler(int sig)
+{
+    printf("\nCaught signal %d\n", sig);
+    close(socket_fd);
+    exit(0);
+}
+
+void catch_signals()
+{
+    signal(SIGINT, sigint_handler);
 }
 
 int main(int argc, char **argv)
 {
     int port_number = atoi(argv[1]);
+    catch_signals();
     server_init(port_number);
     return 0;
 }
