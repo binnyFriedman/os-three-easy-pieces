@@ -7,4 +7,4 @@ include_directories(.)
 
 add_executable(os_three_easy_pieces
         19-paging-faster-translations/tlb.c
-        )
+        thread_api.c cuncurrency/sloppyCounter.c)

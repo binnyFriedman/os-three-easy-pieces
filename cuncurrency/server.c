@@ -19,9 +19,75 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <aio.h>
+#include <errno.h>
+
+#define MAX_CLIENTS 150
+
+enum operation_type
+{
+    READ,
+    WRITE
+};
+struct disk_operation
+{
+    int connection_fd;
+    char *file_buffer;
+    struct aiocb *aiocb;
+    enum operation_type type;
+};
+
+struct disk_operation *io_state_init(int connection_fd, struct aiocb *aiocb, char *buffer, enum operation_type type)
+{
+    struct disk_operation *state = malloc(sizeof(struct disk_operation));
+    state->connection_fd = connection_fd;
+    state->aiocb = aiocb;
+    state->file_buffer = buffer;
+    state->type = type;
+    return state;
+}
 
 int socket_fd;
+struct disk_operation *ongoing_disk_operations[MAX_CLIENTS];
+fd_set fds, readfds;
+int fdmax;
 
+void add_disk_operation(struct disk_operation *op)
+{
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (ongoing_disk_operations[i] == NULL)
+        {
+            ongoing_disk_operations[i] = op;
+            return;
+        }
+    }
+}
+
+void remove_disk_operation(struct disk_operation *op)
+{
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (ongoing_disk_operations[i] != NULL && ongoing_disk_operations[i] == op)
+        {
+            struct disk_operation *temp = ongoing_disk_operations[i];
+            ongoing_disk_operations[i] = NULL;
+            free((void *)temp->aiocb->aio_buf);
+            free(temp->aiocb);
+            free(temp);
+            return;
+        }
+    }
+}
+
+void add_fd_to_event_loop(int fd)
+{
+    FD_SET(fd, &fds);
+    if (fd > fdmax)
+        fdmax = fd;
+}
 void error(const char *msg)
 {
     perror(msg);
@@ -76,9 +142,20 @@ char *cleanPath(char *path)
     int i = 0;
     for (i = 0; i < strlen(path); i++)
     {
-        if (path[i] == '/')
+        if (path[i] == '.')
         {
-            newPath[i] = '_';
+            if (path[i + 1] == '.' && path[i + 2] == '/')
+            {
+                i = i + 2;
+            }
+            else if (path[i + 1] == '/')
+            {
+                i = i + 1;
+            }
+            else
+            {
+                newPath[i] = path[i];
+            }
         }
         else
         {
@@ -89,22 +166,9 @@ char *cleanPath(char *path)
     return newPath;
 }
 
-char *process_my_request(char *buffer)
+int isRequestForNewConnection(int fd)
 {
-    int fd = getServerFileDescriptor(cleanPath(buffer));
-    if (fd < 0)
-        return NULL;
-    struct stat st;
-    fstat(fd, &st);
-    char *file_buffer = malloc(st.st_size);
-    read(fd, file_buffer, st.st_size);
-    close(fd);
-    return file_buffer;
-}
-
-int isRequestForNewConnection(int fd, int listener)
-{
-    return fd == listener;
+    return fd == socket_fd;
 }
 
 int areIncomingMessages(int fd, fd_set *read_fds)
@@ -139,38 +203,52 @@ int accept_connection(int listener)
     return newsockfd;
 }
 
-void handle_request(char *buffer, int fd, int *fdmax)
+struct aiocb *init_aiocb(int fd, volatile void *file_buffer, size_t file_size)
 {
-    char *response = process_my_request(buffer);
-    if (response != NULL)
-    {
-        write(fd, response, strlen(response));
-        free(response);
-    }
-    else
-    {
-        write(fd, "404", 3);
-    }
+    struct aiocb *aiocbp = malloc(sizeof(struct aiocb));
+    aiocbp->aio_fildes = fd;
+    aiocbp->aio_offset = 0;
+    aiocbp->aio_buf = file_buffer;
+    aiocbp->aio_nbytes = file_size;
+    return aiocbp;
 }
 
-void handle_new_connection(int fd, int *fdmax, fd_set *fds)
+int process_my_request(char *buffer, int connection_fd)
+{
+    int fd = getServerFileDescriptor(cleanPath(buffer));
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    fstat(fd, &st);
+    char *file_buffer = malloc(st.st_size);
+    struct aiocb *aiocbp = init_aiocb(fd, file_buffer, st.st_size);
+    aio_read(aiocbp);
+
+    add_disk_operation(io_state_init(connection_fd, aiocbp, file_buffer, READ));
+    return 0;
+}
+
+void handle_request(char *buffer, int fd)
+{
+    int status = process_my_request(buffer, fd);
+    if (status == -1)
+        write(fd, "404", 3);
+}
+
+void handle_new_connection(int fd)
 {
     int newsockfd = accept_connection(fd);
-    FD_SET(newsockfd, fds);
-    if (newsockfd > *fdmax)
-    {
-        *fdmax = newsockfd;
-    }
+    add_fd_to_event_loop(newsockfd);
 }
 
-void client_disconnected(int fd, fd_set *fds)
+void client_disconnected(int fd)
 {
     printf("Client disconnected\n");
-    FD_CLR(fd, fds);
+    FD_CLR(fd, &fds);
     close(fd);
 }
 
-void handle_incoming_messages(int fd, int *fdmax, fd_set *fds)
+void handle_incoming_messages(int fd)
 {
     char buffer[256];
     bzero(buffer, 256);
@@ -178,39 +256,69 @@ void handle_incoming_messages(int fd, int *fdmax, fd_set *fds)
     if (read_status < 0)
         error("ERROR reading from socket");
     if (read_status == 0)
-        client_disconnected(fd, fds);
+        client_disconnected(fd);
     else
-        handle_request(buffer, fd, fdmax);
+        handle_request(buffer, fd);
 }
 
-void process_poll(int fd, int sockfd, int *fdmax, fd_set *read_fds, fd_set *fds)
+void process_poll(int fd)
 {
-    if (isRequestForNewConnection(fd, sockfd))
-        handle_new_connection(fd, fdmax, fds);
+    if (isRequestForNewConnection(fd))
+        handle_new_connection(fd);
     else
-        handle_incoming_messages(fd, fdmax, fds);
+        handle_incoming_messages(fd);
+}
+
+void process_op_completed(struct disk_operation *d_op, int index)
+{
+    write(d_op->connection_fd, d_op->file_buffer, d_op->aiocb->aio_nbytes);
+    remove_disk_operation(d_op);
+}
+
+void process_completed_disk_operations()
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (ongoing_disk_operations[i] != NULL)
+        {
+            int op_stat = aio_error(ongoing_disk_operations[i]->aiocb);
+            if (op_stat == EINPROGRESS)
+                continue;
+            if (aio_return(ongoing_disk_operations[i]->aiocb) == -1)
+            {
+                perror("Error while reading or writing to disk");
+                remove_disk_operation(ongoing_disk_operations[i]);
+            }
+            else
+            {
+                process_op_completed(ongoing_disk_operations[i], i);
+            }
+        }
+    }
 }
 
 int poll_loop(int socket_file_descriptor)
 {
-    fd_set fds, readfds;
+
     struct sockaddr_storage;
-    int fdmax;
+
     fdmax = socket_file_descriptor;
 
     FD_ZERO(&fds);
     FD_SET(socket_file_descriptor, &fds);
+    struct timeval tv = {0, 100};
     while (1)
     {
         readfds = fds;
-        if (select(fdmax + 1, &readfds, NULL, NULL, NULL) == -1)
+        if (select(fdmax + 1, &readfds, NULL, NULL, &tv) == -1)
             error("select");
 
         for (int fd = 0; fd <= (fdmax + 1); fd++)
         {
             if (areIncomingMessages(fd, &readfds))
-                process_poll(fd, socket_file_descriptor, &fdmax, &readfds, &fds);
+                process_poll(fd);
         }
+        process_completed_disk_operations();
     }
 }
 

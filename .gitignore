@@ -1,3 +1,5 @@
 cmake-build-debug
 *.dSYM
 .idea
+.DS_Store
+*.out
